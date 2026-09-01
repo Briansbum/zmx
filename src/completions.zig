@@ -32,7 +32,7 @@ const bash_completions =
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
     \\
-    \\  local commands="attach run send print write detach list kill history get set clear print-env wait tail completions version help"
+    \\  local commands="attach run send print write detach list restore save kill history get set clear print-env wait tail completions version help"
     \\
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=($(compgen -W "$commands" -- "$cur"))
@@ -40,7 +40,7 @@ const bash_completions =
     \\  fi
     \\
     \\  case "$prev" in
-    \\    attach|run|send|print|write|kill|history|get|set|clear|print-env|wait|tail)
+    \\    attach|run|send|print|write|kill|history|get|set|clear|print-env|wait|tail|save)
     \\      local sessions=$(zmx list --short 2>/dev/null | tr '\n' ' ')
     \\      COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
     \\      ;;
@@ -81,6 +81,8 @@ const zsh_completions =
     \\        'write:Write stdin to file_path through the session'
     \\        'detach:Detach all clients from current session'
     \\        'list:List active sessions'
+    \\        'restore:Recreate cached sessions as detached daemons'
+    \\        'save:Save session context now'
     \\        'kill:Kill a session'
     \\        'history:Output session scrollback'
     \\        'wait:Wait for session tasks to complete'
@@ -97,7 +99,7 @@ const zsh_completions =
     \\      ;;
     \\    args)
     \\      case $words[2] in
-    \\        attach|a|kill|k|run|r|send|s|print|p|write|wr|history|get|g|set|clear|print-env|hi|wait|w|tail|t)
+    \\        attach|a|kill|k|run|r|send|s|print|p|write|wr|history|get|g|set|clear|print-env|hi|wait|w|tail|t|save)
     \\          _zmx_sessions
     \\          ;;
     \\        completions|c)
@@ -143,6 +145,8 @@ const fish_completions =
     \\complete -c zmx -n "__fish_is_nth_token 1" -a write -d 'Write stdin to file_path through the session'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a detach -d 'Detach all clients (ctrl+\ for current client)'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a list -d 'List active sessions'
+    \\complete -c zmx -n "__fish_is_nth_token 1" -a restore -d 'Recreate cached sessions as detached daemons'
+    \\complete -c zmx -n "__fish_is_nth_token 1" -a save -d 'Save session context now'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a kill -d 'Kill session and all attached clients'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a history -d 'Output session scrollback'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a wait -d 'Wait for session tasks to complete'
@@ -156,7 +160,7 @@ const fish_completions =
     \\complete -c zmx -n "__fish_is_nth_token 1" -a help -d 'Show help message'
     \\
     \\# Complete session names and shells
-    \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from a attach r run s send p print wr write hi history g get se set cl clear print-env" -a '(zmx list --short 2>/dev/null)' -d 'Session name'
+    \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from a attach r run s send p print wr write hi history g get se set cl clear print-env save" -a '(zmx list --short 2>/dev/null)' -d 'Session name'
     \\complete -c zmx -n "not __fish_is_nth_token 1; and __fish_seen_subcommand_from k kill w wait t tail" -a '(zmx list --short 2>/dev/null)' -d 'Session name'
     \\
     \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from c completions" -a 'bash zsh fish nu' -d Shell
@@ -216,6 +220,10 @@ const nu_completions =
     \\
     \\export extern "zmx detach" []
     \\export extern "zmx list" [--short]
+    \\export extern "zmx restore" []
+    \\export extern "zmx save" [
+    \\    name?: string@"nu-complete zmx sessions"
+    \\]
     \\export extern "zmx history" [name: string@"nu-complete zmx sessions", --vt, --html]
     \\export extern "zmx wait" [...sessions: string@"nu-complete zmx sessions"]
     \\export extern "zmx tail" [...sessions: string@"nu-complete zmx sessions"]

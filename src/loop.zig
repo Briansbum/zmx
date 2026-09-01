@@ -12,6 +12,8 @@ const signal = @import("signal.zig");
 const assert = std.debug.assert;
 const daemonize = @import("daemonize.zig");
 const builtin = @import("builtin");
+const proc = @import("proc.zig");
+const restore = @import("restore.zig");
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
@@ -247,6 +249,9 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
 
     var had_terminal_client = daemon.hasTerminalClient();
 
+    const capture_interval_ns: i96 = @as(i96, daemon.cfg.restore_interval_s) * std.time.ns_per_s;
+    var next_capture_ns: i96 = 0; // 0 => capture on the first iteration
+
     daemon_loop: while (daemon.running) {
         // If the program asked for focus reports (DECSET 1004), send focus-out
         // when the last attached client leaves and focus-in when one returns,
@@ -289,7 +294,22 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
             });
         }
 
-        _ = try lib_posix.poll(poll_fds.items, -1);
+        const poll_timeout: i32 = if (!daemon.cfg.restore_enabled) -1 else blk: {
+            const now = std.Io.Timestamp.now(io, .boot).nanoseconds;
+            if (now >= next_capture_ns) break :blk 0;
+            const ms = @divTrunc(next_capture_ns - now + std.time.ns_per_ms - 1, std.time.ns_per_ms);
+            break :blk @intCast(@min(ms, std.math.maxInt(i32)));
+        };
+        _ = try lib_posix.poll(poll_fds.items, poll_timeout);
+
+        if (daemon.cfg.restore_enabled) {
+            const now = std.Io.Timestamp.now(io, .boot).nanoseconds;
+            if (now >= next_capture_ns) {
+                daemon.setPwd(&term);
+                daemon.captureState(gpa, io, false);
+                next_capture_ns = now + capture_interval_ns;
+            }
+        }
 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             signal.drainSignalPipe();
@@ -297,6 +317,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                 "SIGTERM received, shutting down gracefully session={s}",
                 .{daemon.session_name},
             );
+            daemon.exit_reason = .sigterm;
             break :daemon_loop;
         }
 
@@ -349,6 +370,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     // write buffers are flushed via the normal POLLOUT path.
                     // On the next iteration, daemon.running will be false.
                     daemon.running = false;
+                    daemon.exit_reason = .shell_exit;
                 } else {
                     // Feed PTY output to terminal emulator for state tracking
                     vt_stream.nextSlice(buf[0..n]);
@@ -481,7 +503,14 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                             break :clients_loop;
                         },
                         .Kill => {
+                            daemon.exit_reason = .killed;
                             break :daemon_loop;
+                        },
+                        .Save => {
+                            daemon.setPwd(&term);
+                            daemon.captureState(gpa, io, true);
+                            try ipc.appendMessage(gpa, &client.write_buf, .Ack, "");
+                            client.has_pending_output = true;
                         },
                         .Info => try daemon.handleInfo(gpa, client, &term),
                         .LabelGet => try daemon.handleLabelGet(gpa, client),
@@ -526,6 +555,24 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
             }
         }
     }
+}
+
+/// Joins argv into one copy-pasteable command line, quoting args that need
+/// it (same display logic as handleInfo).
+fn joinQuoted(gpa: std.mem.Allocator, args: []const []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (args, 0..) |arg, i| {
+        if (i > 0) try out.append(gpa, ' ');
+        if (util.shellNeedsQuoting(arg)) {
+            const quoted = try util.shellQuote(gpa, arg);
+            defer gpa.free(quoted);
+            try out.appendSlice(gpa, quoted);
+        } else {
+            try out.appendSlice(gpa, arg);
+        }
+    }
+    return out.toOwnedSlice(gpa);
 }
 
 const ClientResult = struct {
@@ -605,6 +652,8 @@ pub const Daemon = struct {
     task_ended_at: ?u64 = null, // timestamp when task exited
     pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
     shell: []const u8 = "/bin/sh",
+    exit_reason: enum { none, shell_exit, killed, sigterm } = .none,
+    last_capture_hash: u64 = 0,
 
     /// Create a Daemon. Caller is responsible for freeing all variables passed
     /// into the init fn.
@@ -790,6 +839,7 @@ pub const Daemon = struct {
         // =======
 
         self.pid = pty_info.pid;
+        self.pty_fd = pty_info.master_fd;
 
         var threaded: std.Io.Threaded = .init_single_threaded;
         defer threaded.deinit();
@@ -842,6 +892,12 @@ pub const Daemon = struct {
 
         try daemonLoop(self, gpa, new_io, server_sock_fd, pty_info.master_fd);
         std.log.info("daemon loop shutdown", .{});
+        // Only intentional session ends drop the state file; SIGTERM (reboot)
+        // and crashes keep it so the session can be restored. Not gated on
+        // restore_enabled: a `zmx save`d session must also clean up.
+        if (self.exit_reason == .shell_exit or self.exit_reason == .killed) {
+            restore.remove(gpa, new_io, self.cfg.restore_dir, sesh_name);
+        }
         return true;
     }
 
@@ -1074,6 +1130,42 @@ pub const Daemon = struct {
         lib_posix.kill(-self.pid, lib_posix.SIG.KILL) catch |err| {
             std.log.warn("failed to send SIGKILL to pty child err={s}", .{@errorName(err)});
         };
+    }
+
+    /// Persists the session's context (cwd, foreground command) so it can be
+    /// skeletoned back after a reboot. Hash-guarded so unchanged context is
+    /// not rewritten unless forced; failures are logged and never disturb the
+    /// daemon loop.
+    fn captureState(self: *Daemon, gpa: std.mem.Allocator, io: std.Io, force: bool) void {
+        const argv = proc.foregroundArgv(gpa, io, self.pty_fd, self.pid);
+        defer if (argv) |a| proc.freeArgv(gpa, a);
+
+        const cmd: ?[]u8 = if (argv) |a| joinQuoted(gpa, a) catch null else null;
+        defer if (cmd) |c| gpa.free(c);
+
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(self.cwd_path);
+        hasher.update("\x00");
+        if (cmd) |c| hasher.update(c);
+        const hash = hasher.final();
+        if (!force and hash == self.last_capture_hash) return;
+
+        restore.save(gpa, io, self.cfg.restore_dir, self.cfg.dir_mode, self.cfg.log_mode, .{
+            .name = self.session_name,
+            .cwd = self.cwd_path,
+            .cwd_uri = self.cwd,
+            .shell = self.shell,
+            .cmd = cmd,
+            .argv = argv,
+            .captured_at = @intCast(std.Io.Timestamp.now(io, .real).toSeconds()),
+        }) catch |err| {
+            std.log.warn(
+                "failed to save session state session={s} err={s}",
+                .{ self.session_name, @errorName(err) },
+            );
+            return;
+        };
+        self.last_capture_hash = hash;
     }
 
     pub fn handleInfo(self: *Daemon, gpa: std.mem.Allocator, client: *Client, term: *ghostty_vt.Terminal) !void {

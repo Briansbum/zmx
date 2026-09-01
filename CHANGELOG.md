@@ -6,6 +6,10 @@ Use spec: https://common-changelog.org/
 
 ### Added
 
+- Session restore: with `ZMX_RESTORE` set, each session periodically captures its context (cwd, shell, foreground command) to `ZMX_RESTORE_DIR` as JSON
+  - `zmx restore` recreates cached sessions as detached daemons; `attach`/`list` do it automatically when no sessions are alive
+  - `ZMX_RESTORE_CMD` pre-types the captured foreground command at the restored prompt; press enter to resume
+  - `zmx save [name]` captures on demand, without `ZMX_RESTORE`
 - We now track cwd changes via OSC7
 - Replay window title on attach
 - `ZMX_NO_DETACH_KEY` env var to disable `ctrl+\` keybinding

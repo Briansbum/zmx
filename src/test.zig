@@ -8,4 +8,6 @@ comptime {
     _ = @import("loop.zig");
     _ = @import("cfg.zig");
     _ = @import("daemonize.zig");
+    _ = @import("proc.zig");
+    _ = @import("restore.zig");
 }

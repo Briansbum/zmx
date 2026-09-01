@@ -13,6 +13,10 @@ max_scrollback_lines: usize = 2_000, // same default as tmux
 dir_mode: u32 = 0o750,
 log_mode: u32 = 0o640,
 tracked_envs: []const u8 = "DISPLAY,SSH_AUTH_SOCK,SSH_AGENT_PID,SSH_CONNECTION,WINDOWID,XAUTHORITY,KITTY_LISTEN_ON,KITTY_PID,KITTY_WINDOW_ID",
+restore_enabled: bool = false,
+restore_cmd: bool = false,
+restore_interval_s: u32 = 5,
+restore_dir: []const u8 = "",
 
 pub fn init(alloc: std.mem.Allocator, io: std.Io) !Cfg {
     const socket_dir = try socketDir(alloc);
@@ -30,11 +34,26 @@ pub fn init(alloc: std.mem.Allocator, io: std.Io) !Cfg {
     else
         0o640;
 
+    const restore_interval_s: u32 = if (lib_posix.getenv("ZMX_RESTORE_INTERVAL")) |i|
+        @max(1, std.fmt.parseInt(u32, i, 10) catch 5)
+    else
+        5;
+
+    const restore_dir = if (lib_posix.getenv("ZMX_RESTORE_DIR")) |d|
+        try alloc.dupe(u8, d)
+    else
+        try std.fmt.allocPrint(alloc, "{s}/restore", .{socket_dir});
+    errdefer alloc.free(restore_dir);
+
     var cfg = Cfg{
         .socket_dir = socket_dir,
         .log_dir = log_dir,
         .dir_mode = dir_mode,
         .log_mode = log_mode,
+        .restore_enabled = lib_posix.getenv("ZMX_RESTORE") != null,
+        .restore_cmd = lib_posix.getenv("ZMX_RESTORE_CMD") != null,
+        .restore_interval_s = restore_interval_s,
+        .restore_dir = restore_dir,
     };
 
     try cfg.mkdir(io);
@@ -76,6 +95,7 @@ fn logDir(alloc: std.mem.Allocator) ![]const u8 {
 pub fn deinit(self: *Cfg, alloc: std.mem.Allocator) void {
     if (self.socket_dir.len > 0) alloc.free(self.socket_dir);
     if (self.log_dir.len > 0) alloc.free(self.log_dir);
+    if (self.restore_dir.len > 0) alloc.free(self.restore_dir);
 }
 
 pub fn mkdir(self: *Cfg, io: std.Io) !void {
@@ -85,7 +105,7 @@ pub fn mkdir(self: *Cfg, io: std.Io) !void {
     try mkdirAll(io, self.log_dir, log_perms);
 }
 
-fn mkdirAll(io: std.Io, sub_dir_path: []const u8, permissions: std.Io.Dir.Permissions) !void {
+pub fn mkdirAll(io: std.Io, sub_dir_path: []const u8, permissions: std.Io.Dir.Permissions) !void {
     var it = std.fs.path.componentIterator(sub_dir_path);
     var component = it.last() orelse return error.BadPathName;
     while (true) {
@@ -99,6 +119,59 @@ fn mkdirAll(io: std.Io, sub_dir_path: []const u8, permissions: std.Io.Dir.Permis
         };
         component = it.next() orelse return;
     }
+}
+
+test "Cfg.init restore defaults when env vars are not set" {
+    const alloc = std.testing.allocator;
+
+    _ = cross.c.unsetenv("ZMX_RESTORE");
+    _ = cross.c.unsetenv("ZMX_RESTORE_CMD");
+    _ = cross.c.unsetenv("ZMX_RESTORE_INTERVAL");
+    _ = cross.c.unsetenv("ZMX_RESTORE_DIR");
+
+    var cfg = try Cfg.init(alloc, std.testing.io);
+    defer cfg.deinit(alloc);
+
+    try std.testing.expectEqual(false, cfg.restore_enabled);
+    try std.testing.expectEqual(false, cfg.restore_cmd);
+    try std.testing.expectEqual(@as(u32, 5), cfg.restore_interval_s);
+    try std.testing.expect(std.mem.startsWith(u8, cfg.restore_dir, cfg.socket_dir));
+    try std.testing.expect(std.mem.endsWith(u8, cfg.restore_dir, "/restore"));
+}
+
+test "Cfg.init restore custom values from env vars" {
+    const alloc = std.testing.allocator;
+
+    _ = cross.c.setenv("ZMX_RESTORE", "1", 1);
+    _ = cross.c.setenv("ZMX_RESTORE_CMD", "1", 1);
+    _ = cross.c.setenv("ZMX_RESTORE_INTERVAL", "30", 1);
+    _ = cross.c.setenv("ZMX_RESTORE_DIR", "/tmp/zmx-restore-test", 1);
+    defer {
+        _ = cross.c.unsetenv("ZMX_RESTORE");
+        _ = cross.c.unsetenv("ZMX_RESTORE_CMD");
+        _ = cross.c.unsetenv("ZMX_RESTORE_INTERVAL");
+        _ = cross.c.unsetenv("ZMX_RESTORE_DIR");
+    }
+
+    var cfg = try Cfg.init(alloc, std.testing.io);
+    defer cfg.deinit(alloc);
+
+    try std.testing.expectEqual(true, cfg.restore_enabled);
+    try std.testing.expectEqual(true, cfg.restore_cmd);
+    try std.testing.expectEqual(@as(u32, 30), cfg.restore_interval_s);
+    try std.testing.expectEqualStrings("/tmp/zmx-restore-test", cfg.restore_dir);
+}
+
+test "Cfg.init clamps restore interval to at least 1 second" {
+    const alloc = std.testing.allocator;
+
+    _ = cross.c.setenv("ZMX_RESTORE_INTERVAL", "0", 1);
+    defer _ = cross.c.unsetenv("ZMX_RESTORE_INTERVAL");
+
+    var cfg = try Cfg.init(alloc, std.testing.io);
+    defer cfg.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), cfg.restore_interval_s);
 }
 
 test "Cfg.init uses default modes when env vars are not set" {

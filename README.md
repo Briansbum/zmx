@@ -294,6 +294,28 @@ You can customize this list by setting `ZMX_TRACK_ENV` to a comma-separated list
 export ZMX_TRACK_ENV="DISPLAY,SSH_AUTH_SOCK,GPG_AGENT_INFO"
 ```
 
+## session restore
+
+Sessions are live processes, so nothing survives a reboot. With restore enabled, each session periodically saves the context needed to skeleton it back: session name, working directory, shell, and the foreground command. The cache is one JSON file per session.
+
+- `ZMX_RESTORE` => enables periodic capture and auto-restore (set to any value)
+- `ZMX_RESTORE_CMD` => on restore, types the captured foreground command at the prompt without running it; press enter to resume (set to any value)
+- `ZMX_RESTORE_INTERVAL` => capture interval in seconds (defaults to `5`)
+- `ZMX_RESTORE_DIR` => cache directory (defaults to `{socket dir}/restore`)
+
+Getting sessions back:
+
+- `zmx restore` => spawns a detached session per cached entry, shell started in the cached cwd (works even without `ZMX_RESTORE` set)
+- `zmx attach` / `zmx list` => do the same automatically when `ZMX_RESTORE` is set and no sessions are alive (`zmx list --short` never restores, so shell completions cannot resurrect sessions)
+- `zmx save [name]` => captures immediately, all live sessions when no name is given; works without `ZMX_RESTORE`
+
+Ending a session on purpose (`exit`, `zmx kill`) deletes its cache entry; a reboot or crash keeps it. The default cache location inherits the socket dir, which usually lives under `/tmp` and is cleared on reboot, so point `ZMX_RESTORE_DIR` somewhere that survives:
+
+```bash
+export ZMX_RESTORE=1
+export ZMX_RESTORE_DIR="$HOME/.local/state/zmx/restore"
+```
+
 ## shell completion
 
 Shell auto-completion for `zmx` commands and session names can be enabled using the `completions` subcommand. Once configured, you'll get auto-complete for both local `zmx` commands and sessions:
