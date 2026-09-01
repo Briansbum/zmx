@@ -514,8 +514,20 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         },
                         .Info => try daemon.handleInfo(gpa, client, &term),
                         .LabelGet => try daemon.handleLabelGet(gpa, client),
-                        .LabelSet => try daemon.handleLabelSet(gpa, client, msg.payload),
-                        .LabelClear => try daemon.handleLabelClear(gpa, client),
+                        .LabelSet => {
+                            try daemon.handleLabelSet(gpa, client, msg.payload);
+                            if (daemon.cfg.restore_enabled) {
+                                daemon.setPwd(&term);
+                                daemon.captureState(gpa, io, false);
+                            }
+                        },
+                        .LabelClear => {
+                            try daemon.handleLabelClear(gpa, client);
+                            if (daemon.cfg.restore_enabled) {
+                                daemon.setPwd(&term);
+                                daemon.captureState(gpa, io, false);
+                            }
+                        },
                         .EnvGet => try daemon.handleEnvGet(gpa, client),
                         .EnvSet => try daemon.handleEnvSet(gpa, client, msg.payload),
                         .History => try daemon.handleHistory(gpa, client, &term, msg.payload),
@@ -1142,10 +1154,15 @@ pub const Daemon = struct {
         const cmd: ?[]u8 = if (argv) |a| joinQuoted(gpa, a) catch null else null;
         defer if (cmd) |c| gpa.free(c);
 
+        const labels_str: ?[]u8 = label.labelsToU8(gpa, self.labels) catch null;
+        defer if (labels_str) |l| gpa.free(l);
+
         var hasher = std.hash.Wyhash.init(0);
         hasher.update(self.cwd_path);
         hasher.update("\x00");
         if (cmd) |c| hasher.update(c);
+        hasher.update("\x00");
+        if (labels_str) |l| hasher.update(l);
         const hash = hasher.final();
         if (!force and hash == self.last_capture_hash) return;
 
@@ -1156,6 +1173,7 @@ pub const Daemon = struct {
             .shell = self.shell,
             .cmd = cmd,
             .argv = argv,
+            .labels = labels_str orelse "",
             .captured_at = @intCast(std.Io.Timestamp.now(io, .real).toSeconds()),
         }) catch |err| {
             std.log.warn(

@@ -142,6 +142,32 @@ crash_session() {
   wait_for_cwd test-restore-again "${dir// /%20}"
 }
 
+@test "restore: labels are captured and reapplied" {
+  ZMX_RESTORE=1 ZMX_RESTORE_INTERVAL=1 "$ZMX" run test-restore-labels -d sleep 30
+  wait_for_session test-restore-labels
+
+  run "$ZMX" set test-restore-labels project=zmx env=dev
+  [ "$status" -eq 0 ]
+
+  local state="$(RESTORE_DIR)/test-restore-labels.json"
+  wait_for_file "$state"
+  local i=0
+  while (( i < 50 )) && ! grep -qF '"labels": "env=dev project=zmx"' "$state"; do sleep 0.1; (( i++ )) || true; done
+  grep -qF '"labels": "env=dev project=zmx"' "$state"
+
+  crash_session test-restore-labels
+
+  run "$ZMX" restore
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"restored session test-restore-labels"* ]]
+
+  wait_for_session test-restore-labels
+  run "$ZMX" get test-restore-labels
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"env=dev"* ]]
+  [[ "$output" == *"project=zmx"* ]]
+}
+
 @test "restore: pre-types the captured command only with ZMX_RESTORE_CMD" {
   # `set -m` gives the task shell job control, so the command runs in its own
   # process group and is visible as the pty's foreground process.

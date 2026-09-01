@@ -1182,6 +1182,17 @@ fn restoreSessions(
         };
         if (is_daemon_proc) return .{ .is_daemon_proc = true };
 
+        // Reapply captured labels directly over IPC: labelSet's client-side
+        // validation exits the process, and one bad state file must not
+        // abort the rest of the restore.
+        if (state.labels.len > 0) {
+            const ack = ipc.roundTripForTag(gpa, socket_path, .LabelSet, state.labels, .Ack) catch |err| blk: {
+                std.log.warn("failed to restore labels name={s} err={s}", .{ state.name, @errorName(err) });
+                break :blk null;
+            };
+            if (ack) |a| gpa.free(a);
+        }
+
         if (cfg.restore_cmd) {
             if (state.cmd) |cmd| {
                 // probeSession doubles as the readiness wait; the queued bytes
