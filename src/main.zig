@@ -87,7 +87,11 @@ pub fn main(init: std.process.Init) !void {
         if (restore_result.restored == 0) {
             var errbuf: [4096]u8 = undefined;
             var stderr = std.Io.File.stderr().writer(io, &errbuf);
-            try stderr.interface.print("no cached sessions found in {s}\n", .{cfg.restore_dir});
+            if (restore_result.skipped_live > 0) {
+                try stderr.interface.print("all {d} cached sessions are live\n", .{restore_result.skipped_live});
+            } else {
+                try stderr.interface.print("no cached sessions found in {s}\n", .{cfg.restore_dir});
+            }
             try stderr.interface.flush();
         }
         return;
@@ -1107,6 +1111,7 @@ fn wait(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, matchers: std.ArrayList
 const RestoreResult = struct {
     is_daemon_proc: bool = false,
     restored: usize = 0,
+    skipped_live: usize = 0,
 };
 
 /// True when the restore feature is on and we are not inside a session, so a
@@ -1168,6 +1173,7 @@ fn restoreSessions(
             if (ipc.connectSession(socket_path)) |fd| {
                 lib_posix.close(fd);
                 std.log.info("skipping restore, session is live name={s}", .{state.name});
+                result.skipped_live += 1;
                 continue;
             } else |_| {}
         }

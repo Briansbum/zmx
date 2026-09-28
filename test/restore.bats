@@ -234,6 +234,17 @@ crash_session() {
   [[ "$output" == *"no cached sessions found"* ]]
 }
 
+@test "restore: reports when every cached session is live" {
+  ZMX_RESTORE=1 ZMX_RESTORE_INTERVAL=1 "$ZMX" run test-restore-live -d sleep 30
+  wait_for_session test-restore-live
+  wait_for_file "$(RESTORE_DIR)/test-restore-live.json"
+
+  run "$ZMX" restore
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"all 1 cached sessions are live"* ]]
+  [[ "$output" != *"no cached sessions found"* ]]
+}
+
 @test "save: writes state on demand, without ZMX_RESTORE" {
   "$ZMX" run test-save-one -d sleep 30
   wait_for_session test-save-one
