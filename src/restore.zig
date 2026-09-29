@@ -14,6 +14,7 @@ pub const SessionState = struct {
     shell: []const u8 = "",
     cmd: ?[]const u8 = null,
     argv: ?[]const []const u8 = null,
+    labels: []const u8 = "",
     captured_at: u64 = 0,
 };
 
@@ -188,6 +189,7 @@ test "save and loadAll round-trip" {
         .shell = "/bin/zsh",
         .cmd = "npm run dev",
         .argv = &.{ "npm", "run", "dev" },
+        .labels = "env=dev project=zmx",
         .captured_at = 1756700000,
     });
     try save(alloc, io, dir_path, testing_dir_mode, testing_file_mode, .{
@@ -208,7 +210,9 @@ test "save and loadAll round-trip" {
     try std.testing.expectEqualStrings("npm run dev", loaded.items[1].value.cmd.?);
     try std.testing.expectEqual(@as(usize, 3), loaded.items[1].value.argv.?.len);
     try std.testing.expectEqual(@as(u64, 1756700000), loaded.items[1].value.captured_at);
+    try std.testing.expectEqualStrings("env=dev project=zmx", loaded.items[1].value.labels);
     try std.testing.expect(loaded.items[0].value.cmd == null);
+    try std.testing.expectEqualStrings("", loaded.items[0].value.labels);
 }
 
 test "save overwrites existing state atomically" {
