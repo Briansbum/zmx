@@ -12,6 +12,7 @@ const label = @import("label.zig");
 const lib_posix = @import("posix.zig");
 const signal = @import("signal.zig");
 const Cfg = @import("cfg.zig");
+const restore = @import("restore.zig");
 const loop = @import("loop.zig");
 const Client = loop.Client;
 const Daemon = loop.Daemon;
@@ -61,7 +62,7 @@ pub fn main(init: std.process.Init) !void {
     const shell_env = init.environ_map.get("SHELL") orelse "/bin/sh";
 
     const cmd = args.next() orelse {
-        return list(gpa, io, &cfg, false);
+        return list(gpa, io, &cfg, false, shell_env);
     };
 
     if (std.mem.eql(u8, cmd, "version") or std.mem.eql(u8, cmd, "v") or std.mem.eql(u8, cmd, "-v") or std.mem.eql(u8, cmd, "--version")) {
@@ -74,7 +75,58 @@ pub fn main(init: std.process.Init) !void {
             if (detectHelp(arg)) return help(io);
             if (std.mem.eql(u8, arg, "--short")) short = true;
         }
-        return list(gpa, io, &cfg, short);
+        return list(gpa, io, &cfg, short, shell_env);
+    } else if (std.mem.eql(u8, cmd, "restore")) {
+        while (args.next()) |arg| {
+            if (detectHelp(arg)) return help(io);
+        }
+        var outbuf: [4096]u8 = undefined;
+        var stdout = std.Io.File.stdout().writer(io, &outbuf);
+        const restore_result = try restoreSessions(gpa, io, &cfg, shell_env, &stdout.interface);
+        if (restore_result.is_daemon_proc) return;
+        if (restore_result.restored == 0) {
+            var errbuf: [4096]u8 = undefined;
+            var stderr = std.Io.File.stderr().writer(io, &errbuf);
+            try stderr.interface.print("no cached sessions found in {s}\n", .{cfg.restore_dir});
+            try stderr.interface.flush();
+        }
+        return;
+    } else if (std.mem.eql(u8, cmd, "save")) {
+        var session_name: ?[]const u8 = null;
+        while (args.next()) |arg| {
+            if (detectHelp(arg)) return help(io);
+            session_name = arg;
+        }
+
+        var outbuf: [4096]u8 = undefined;
+        var stdout = std.Io.File.stdout().writer(io, &outbuf);
+
+        if (session_name) |name| {
+            const sesh = try socket.getSeshName(gpa, name);
+            defer gpa.free(sesh);
+            saveSession(gpa, io, &cfg, sesh, &stdout.interface) catch
+                std.process.exit(1);
+            return;
+        }
+
+        // No name: save every live session.
+        var entries = try util.get_session_entries(gpa, io, cfg.socket_dir);
+        defer {
+            for (entries.items) |entry| entry.deinit(gpa);
+            entries.deinit(gpa);
+        }
+        if (countLiveSessions(entries.items) == 0) {
+            return printError(io, "no sessions found in {s}", .{cfg.socket_dir});
+        }
+        var failed = false;
+        for (entries.items) |entry| {
+            if (entry.is_error) continue;
+            saveSession(gpa, io, &cfg, entry.name, &stdout.interface) catch {
+                failed = true;
+            };
+        }
+        if (failed) std.process.exit(1);
+        return;
     } else if (std.mem.eql(u8, cmd, "get") or std.mem.eql(u8, cmd, "g")) {
         const sesh_name = args.next() orelse {
             return printError(io, "session name required (or run inside a zmx session)", .{});
@@ -175,6 +227,20 @@ pub fn main(init: std.process.Init) !void {
 
         const sesh = try socket.getSeshName(gpa, parsed.session_name);
         defer gpa.free(sesh);
+
+        if (shouldAutoRestore(&cfg)) {
+            var entries = try util.get_session_entries(gpa, io, cfg.socket_dir);
+            const live = countLiveSessions(entries.items);
+            for (entries.items) |entry| entry.deinit(gpa);
+            entries.deinit(gpa);
+            if (live == 0) {
+                var outbuf: [4096]u8 = undefined;
+                var stdout = std.Io.File.stdout().writer(io, &outbuf);
+                const restore_result = try restoreSessions(gpa, io, &cfg, shell_env, &stdout.interface);
+                if (restore_result.is_daemon_proc) return;
+            }
+        }
+
         const socket_path = socket.getSocketPath(gpa, cfg.socket_dir, sesh) catch |err| switch (err) {
             error.NameTooLong => return socket.printSessionNameTooLong(io, sesh, cfg.socket_dir),
             error.OutOfMemory => return err,
@@ -516,6 +582,8 @@ fn help(io: std.Io) !void {
         \\  [wr]ite <name> <file_path>                  Write stdin to file_path through the session
         \\  [d]etach                                    Detach all clients (ctrl+\\ for current client)
         \\  [l]ist|ls [--short]                         List active sessions
+        \\  restore                                     Recreate cached sessions as detached daemons
+        \\  save [name]                                 Save session context now (all sessions if no name)
         \\  [g]et <name>                                Get session labels
         \\  set <name> k=v ...                          Set session labels (k= to remove)
         \\  [cl]ear <name>                              Clear all session labels
@@ -540,6 +608,15 @@ fn help(io: std.Io) !void {
         \\    zmx attach dev
         \\    zmx attach dev vim
         \\    zmx attach --labels "project=api role=worker" build
+        \\
+        \\Restore:
+        \\  With ZMX_RESTORE set, each session periodically saves its context
+        \\  (cwd, foreground command) to ZMX_RESTORE_DIR. `zmx restore` spawns a
+        \\  detached session per cached entry; attach and list do the same
+        \\  automatically when no sessions are alive. With ZMX_RESTORE_CMD set,
+        \\  the captured command is typed at the prompt (it may echo during
+        \\  shell startup); press enter to run it. `zmx save` captures on
+        \\  demand and works without ZMX_RESTORE.
         \\
         \\History:
         \\  This should generally be used with `tail` to print the last lines
@@ -660,6 +737,11 @@ fn help(io: std.Io) !void {
         \\  ZMX_DIR_MODE         Sets mode for socket and log directories (octal, defaults to 0750)
         \\  ZMX_LOG_MODE         Sets mode for log files (octal, defaults to 0640)
         \\  ZMX_NO_DETACH_KEY    Disables the ctrl+\ detach shortcut (set to any value)
+        \\  ZMX_RESTORE          Enables session context capture and auto-restore (set to any value)
+        \\  ZMX_RESTORE_CMD      Pre-types the captured foreground command on restore; press
+        \\                       enter to run it (set to any value)
+        \\  ZMX_RESTORE_INTERVAL Capture interval in seconds (defaults to 5)
+        \\  ZMX_RESTORE_DIR      Session context cache directory (defaults to <socket dir>/restore)
         \\
     ;
     var buf: [8192]u8 = undefined;
@@ -1022,7 +1104,129 @@ fn wait(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, matchers: std.ArrayList
     std.process.exit(agg_exit_code);
 }
 
-fn list(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, short: bool) !void {
+const RestoreResult = struct {
+    is_daemon_proc: bool = false,
+    restored: usize = 0,
+};
+
+/// True when the restore feature is on and we are not inside a session, so a
+/// zero-session list/attach may repopulate from the cache.
+fn shouldAutoRestore(cfg: *Cfg) bool {
+    return cfg.restore_enabled and socket.getSeshNameFromEnv().len == 0;
+}
+
+fn countLiveSessions(sessions: []const util.SessionEntry) usize {
+    var live: usize = 0;
+    for (sessions) |session| {
+        if (!session.is_error) live += 1;
+    }
+    return live;
+}
+
+/// Spawns a detached daemon for every cached session state without a live
+/// socket: shell restarted in the cached cwd, and, when ZMX_RESTORE_CMD is
+/// set, the captured foreground command pre-typed into the pty (no newline,
+/// press enter to run it). When the returned result says the current process
+/// is a forked daemon, the caller must return immediately. Progress lines go
+/// through the caller's stdout writer: a second writer on the same fd would
+/// overwrite it positionally when stdout is a regular file.
+fn restoreSessions(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cfg: *Cfg,
+    shell_env: []const u8,
+    stdout: *std.Io.Writer,
+) !RestoreResult {
+    var loaded = restore.loadAll(gpa, io, cfg.restore_dir) catch |err| {
+        std.log.warn("failed to load session state dir={s} err={s}", .{ cfg.restore_dir, @errorName(err) });
+        return .{};
+    };
+    defer {
+        for (loaded.items) |*parsed| parsed.deinit();
+        loaded.deinit(gpa);
+    }
+
+    var result = RestoreResult{};
+
+    var dir = try std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{});
+    defer dir.close(io);
+
+    for (loaded.items) |parsed| {
+        const state = parsed.value;
+
+        const socket_path = socket.getSocketPath(gpa, cfg.socket_dir, state.name) catch |err| switch (err) {
+            error.NameTooLong => {
+                std.log.warn("skipping restore, session name too long name={s}", .{state.name});
+                continue;
+            },
+            error.OutOfMemory => return err,
+        };
+        defer gpa.free(socket_path);
+
+        // A live daemon owns its state file; leave its session alone.
+        if (socket.sessionExists(io, dir, state.name) catch false) {
+            if (ipc.connectSession(socket_path)) |fd| {
+                lib_posix.close(fd);
+                std.log.info("skipping restore, session is live name={s}", .{state.name});
+                continue;
+            } else |_| {}
+        }
+
+        var daemon = Daemon.init(io, cfg, state.name, socket_path);
+        if (state.cwd.len > 0) daemon.setCwd(state.cwd);
+        daemon.shell = if (state.shell.len > 0) state.shell else shell_env;
+
+        const is_daemon_proc = daemon.ensureSession(io) catch |err| {
+            std.log.warn("failed to restore session name={s} err={s}", .{ state.name, @errorName(err) });
+            continue;
+        };
+        if (is_daemon_proc) return .{ .is_daemon_proc = true };
+
+        if (cfg.restore_cmd) {
+            if (state.cmd) |cmd| {
+                // probeSession doubles as the readiness wait; the queued bytes
+                // land in the shell's line editor, no trailing CR.
+                if (ipc.probeSession(gpa, socket_path)) |probe_result| {
+                    defer probe_result.deinit();
+                    ipc.send(probe_result.fd, .Send, cmd) catch |err| {
+                        std.log.warn("failed to pre-type command name={s} err={s}", .{ state.name, @errorName(err) });
+                    };
+                } else |err| {
+                    std.log.warn("failed to pre-type command name={s} err={s}", .{ state.name, @errorName(err) });
+                }
+            }
+        }
+
+        result.restored += 1;
+        try stdout.print("restored session {s}\n", .{state.name});
+        try stdout.flush();
+    }
+
+    return result;
+}
+
+/// Asks one session's daemon to capture its context to disk right now.
+fn saveSession(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, name: []const u8, stdout: *std.Io.Writer) !void {
+    const socket_path = socket.getSocketPath(gpa, cfg.socket_dir, name) catch |err| switch (err) {
+        error.NameTooLong => return socket.printSessionNameTooLong(io, name, cfg.socket_dir),
+        error.OutOfMemory => return err,
+    };
+    defer gpa.free(socket_path);
+
+    const ack = ipc.roundTripForTag(gpa, socket_path, .Save, "", .Ack) catch |err| {
+        var errbuf: [4096]u8 = undefined;
+        var stderr = std.Io.File.stderr().writer(io, &errbuf);
+        stderr.interface.print("failed to save session {s}: {s}\n", .{ name, @errorName(err) }) catch {};
+        stderr.interface.flush() catch {};
+        return err;
+    };
+    gpa.free(ack);
+
+    try stdout.print("saved session {s}\n", .{name});
+    try stdout.flush();
+}
+
+fn list(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, short: bool, shell_env: []const u8) !void {
     const current_session = socket.getSeshNameFromEnv();
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &buf);
@@ -1032,6 +1236,18 @@ fn list(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, short: bool) !void {
             session.deinit(alloc);
         }
         sessions.deinit(alloc);
+    }
+
+    // Auto-restore, but never from --short: completions and scripts poll it
+    // constantly and must not resurrect sessions as a side effect.
+    if (!short and shouldAutoRestore(cfg) and countLiveSessions(sessions.items) == 0) {
+        const restore_result = try restoreSessions(alloc, io, cfg, shell_env, &stdout.interface);
+        if (restore_result.is_daemon_proc) return;
+        if (restore_result.restored > 0) {
+            for (sessions.items) |session| session.deinit(alloc);
+            sessions.deinit(alloc);
+            sessions = try util.get_session_entries(alloc, io, cfg.socket_dir);
+        }
     }
 
     if (sessions.items.len == 0) {
@@ -1103,6 +1319,9 @@ fn kill(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u
         std.log.err("session unresponsive: {s}", .{@errorName(err)});
         if (force or err == error.ConnectionRefused) {
             socket.cleanupStaleSocket(io, dir, session_name);
+            // The daemon is dead and cannot delete its own state file; an
+            // explicit kill means this session must not be restored.
+            restore.remove(alloc, io, cfg.restore_dir, session_name);
             var ebuf: [4096]u8 = undefined;
             var ew = std.Io.File.stderr().writer(io, &ebuf);
             ew.interface.print("cleaned up stale session {s}\n", .{session_name}) catch {};

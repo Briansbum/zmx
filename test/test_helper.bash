@@ -12,6 +12,10 @@ setup() {
   # Isolate socket dir so tests don't interfere with real sessions or each other
   export ZMX_DIR="$BATS_TEST_TMPDIR/zmx-sockets"
   mkdir -p "$ZMX_DIR"
+
+  # Isolate from the invoking environment: running the suite from inside a zmx
+  # session or with restore configured must not change test behaviour
+  unset ZMX_SESSION ZMX_RESTORE ZMX_RESTORE_CMD ZMX_RESTORE_DIR ZMX_RESTORE_INTERVAL
 }
 
 teardown() {
