@@ -34,10 +34,10 @@
 
 ### binaries
 
-- https://zmx.sh/a/zmx-0.7.1-linux-aarch64.tar.gz
-- https://zmx.sh/a/zmx-0.7.1-linux-x86_64.tar.gz
-- https://zmx.sh/a/zmx-0.7.1-macos-aarch64.tar.gz
-- https://zmx.sh/a/zmx-0.7.1-macos-x86_64.tar.gz
+- https://zmx.sh/a/zmx-0.8.1-linux-aarch64.tar.gz
+- https://zmx.sh/a/zmx-0.8.1-linux-x86_64.tar.gz
+- https://zmx.sh/a/zmx-0.8.1-macos-aarch64.tar.gz
+- https://zmx.sh/a/zmx-0.8.1-macos-x86_64.tar.gz
 
 ### homebrew
 
@@ -116,7 +116,7 @@ Commands:
   [hi]story <name> [--vt|--html]           Output session scrollback
   [w]ait <name>...                         Wait for session tasks to complete
   [t]ail <name>...                         Follow session output
-  [c]ompletions <shell>                    Shell completions (bash, zsh, fish, nu)
+  [c]ompletions <shell>                    Shell completions (bash, zsh, fish, nu, yash)
   [v]ersion                                Show version and metadata (socket dir, log dir)
   [h]elp                                   Show this help
 ```
@@ -294,6 +294,28 @@ You can customize this list by setting `ZMX_TRACK_ENV` to a comma-separated list
 export ZMX_TRACK_ENV="DISPLAY,SSH_AUTH_SOCK,GPG_AGENT_INFO"
 ```
 
+## session restore
+
+Sessions are live processes, so nothing survives a reboot. With restore enabled, each session periodically saves the context needed to skeleton it back: session name, working directory, shell, and the foreground command. The cache is one JSON file per session.
+
+- `ZMX_RESTORE` => enables periodic capture and auto-restore (set to any value)
+- `ZMX_RESTORE_CMD` => on restore, types the captured foreground command at the prompt without running it; press enter to resume (set to any value)
+- `ZMX_RESTORE_INTERVAL` => capture interval in seconds (defaults to `5`)
+- `ZMX_RESTORE_DIR` => cache directory (defaults to `{socket dir}/restore`)
+
+Getting sessions back:
+
+- `zmx restore` => spawns a detached session per cached entry, shell started in the cached cwd (works even without `ZMX_RESTORE` set)
+- `zmx attach` / `zmx list` => do the same automatically when `ZMX_RESTORE` is set and no sessions are alive (`zmx list --short` never restores, so shell completions cannot resurrect sessions)
+- `zmx save [name]` => captures immediately, all live sessions when no name is given; works without `ZMX_RESTORE`
+
+Ending a session on purpose (`exit`, `zmx kill`) deletes its cache entry; a reboot or crash keeps it. The default cache location inherits the socket dir, which usually lives under `/tmp` and is cleared on reboot, so point `ZMX_RESTORE_DIR` somewhere that survives:
+
+```bash
+export ZMX_RESTORE=1
+export ZMX_RESTORE_DIR="$HOME/.local/state/zmx/restore"
+```
+
 ## shell completion
 
 Shell auto-completion for `zmx` commands and session names can be enabled using the `completions` subcommand. Once configured, you'll get auto-complete for both local `zmx` commands and sessions:
@@ -333,6 +355,32 @@ Add this to `~/.config/fish/completions/zmx.fish`:
 if type -q zmx
   zmx completions fish | source
 end
+```
+
+### yash
+
+Add this to your `~/.config/yash/rc`:
+
+```sh
+if command -v zmx > /dev/null 2>&1; then
+  eval "$(zmx completions yash)"
+fi
+```
+
+Or save as an autoloaded script in your completion directory:
+
+```sh
+zmx completions yash > ~/.config/yash/completion/zmx
+```
+
+### nu
+
+Add this to your Nushell config (`config.nu`):
+
+```nu
+use ("~/.cache/zmx/completions.nu" | path expand)
+# Or generate dynamically:
+zmx completions nu | save -f ~/.cache/zmx/completions.nu
 ```
 
 ## session picker
@@ -612,3 +660,4 @@ abduco provides session management (i.e. it allows programs to be run independen
 - [zsm](https://github.com/mdsakalu/zmx-session-manager) -- TUI session manager for zmx. List, preview, filter, and kill sessions from an interactive terminal UI.
 - [zmosh](https://github.com/mmonad/zmosh) -- A fork of zmx that adds encrypted UDP auto-reconnect for remote sessions (like mosh).
 - [zmx-picker](https://github.com/EarthmanMuons/zmx-picker) -- fzf-based session picker and project launcher. Jump to a running zmx session or start one inside any of your git/jj repos.
+- [rootshell](https://github.com/kitknox/rootshell) -- Metal-accelerated terminal for iPhone, iPad, Vision Pro, and Mac. Lists active zmx sessions with live previews and can auto-attach on connect.
